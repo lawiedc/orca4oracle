@@ -1,0 +1,1018 @@
+#!/usr/local/bin/perl
+
+BEGIN {
+    $ENV{ORACLE_HOME} = "/app/oracle/DNYDCL50/product/RAC/10.2.0";
+    $ENV{NLS_LANG} = "AMERICAN_AMERICA.US7ASCII";
+}
+
+=pod
+=head1 orca_oracle
+
+orca_oracle is an oracle statistics collection agent.  Data is mostly collected
+from the AWR tables, and, generally, converted to percentage values.
+
+Data is output to a file of the form dbname/orca_oracle-i{n}-YYYY-MM-DD.{xx},
+where n is the instance number and xx is the file number for the day (if the
+number of tablespaces changes, a new file will be opened.)  For each new
+file a descriptive header line is written.  Otherwise, the data line is
+simply appended to the file.  Choice of output format has principally been
+to fit the format required by Orca, a monitoring and display tool written 
+by Dr. Blair Zajac.  In fact, this script can be considered a "collection 
+agent" for Orca, though it is also possible to load the data to spreadsheeting
+applications.
+
+The  purpose of this tool is graphing the values available in the AWR
+reports, allowing a quick, visual pinpointing of interesting values.  In addition,
+as orca can collect data over the long term trends and cycles in database 
+usage also become apparent.
+
+As far as possible, simple queries are made on the database, with calculations
+being carried out by perl to reduce database overhead.  This is, naturally,
+most effective if this script runs on a client rather than on the database
+server.
+
+=head2 Installation and initial set-up
+
+The script requires the installation of DBD and DBI::Oracle.
+
+Before first usage, check the values of 
+- $ORACLE_HOME, set in the BEGIN block above
+- $mailids, set below, and being a comma separated list of addresses to mail
+          in case of errors in the running of the script
+- $dbuser, a userid in the form of scott/tiger which has select access on
+          the tables queried.  See the sample user create code below (or
+	  supplied as orca_user.sql).
+- $out_dir, the directory for storing data output.  Note that a separate
+          directory for each database is required.
+- check the snapshot to begin from, and use the -s option as detailed below.
+
+=head2 Command Line Options
+
+orca_oracle [-i interval] [ -s lastsnap ] [-o out_file] [-t timezoneadjust ] [-c] dbname
+
+-i interval : An integer.  The interval in minutes between snapshots.
+              Default: 60 minutes.
+
+-s lastsnap : An integer.  Set the snapshot to start from.  This is necessary on
+              the first run of orca_oracle for a new database, and may be useful
+	      if the database has been restarted several times between snapshots.
+	      Default: The latest snapshot against which orca_oracle has already run.
+
+-o out_file : A string.  Set the file to write output into.  This is most useful
+              for testing changes.  Default: $out_dir/dbname/orca_oracle-YYYY-MM-DD.xx.
+
+-t timezoneadjust : A (potentially negative) number e.g. -4.5.  Adjust the time
+              collected by AWR.  This may be useful where the database 
+	      timezone is different to that of other stats collected.
+	      Default: 0.
+
+-c          : Catch-up.  Run through all the AWR snapshots since the last run.
+              This is useful on the first run against a database, or if the
+	      interval for running orca_oracle is different to that for running
+	      snapshots.
+
+dbname      :  A database name as understood by TNS*Listener.
+
+=head2 orca_user.sql
+
+connect / as sysdba
+create user orca identified by orca;
+grant create session to orca;
+grant select on wrm$_snapshot to orca;
+grant select on wrh$_latch to orca;
+grant select on wrh$_librarycache to orca;
+grant select on wrh$_sgastat to orca;
+grant select on wrh$_waitstat to orca;
+grant select on wrm$_snapshot to orca;
+grant select on wrh$_stat_name to orca;
+grant select on wrh$_sgastat to orca;
+grant select on wrh$_sysstat to orca;
+grant select on v_$parameter to orca;
+grant select on v_$sort_segment to orca;
+grant select on v_$temp_space_header to orca;
+grant select on dba_data_files to orca;
+grant select on dba_temp_files to orca;
+grant select on dba_free_space to orca;
+
+
+CHANGES                                             BY             DATE
+Initial Version                                    D.C.Lawie       August    1999
+Add in support for changing number of data columns D.C.Lawie       October   1999
+First attempt to rewrite to use perfstat data      D.C.Lawie       September 2003
+Implementation of fully perfstat-based collection  D.C.Lawie       May       2004
+Correct free space accounting for temp tspaces     D.C.Lawie       November  2004
+Get stats for current instance correctly in RAC
+  also, output v$sgastat values for shared pool    D.C.Lawie       January   2005
+Output raw value for reloads per sec               N.Noble         February  2005
+Correct bug in gathering instance start time       R.Dempsey       May       2005
+Upgrade to Oracle 10, and assume RAC               D.C.Lawie       April     2006
+Fix bug in snapshot selection for instance > 1     D.C.Lawie       April     2006
+Add option to adjust timezone of snapshots         D.C.Lawie       May       2006
+=cut
+
+use strict;
+use DBI;
+use Getopt::Std;
+use Time::localtime;
+
+my (
+    $mailids,		# a list of ids to mail in case of error.
+    $dbuser,            # database userid/passwd
+    $dbname,            # as understood by TNS*Listener
+    $dbh,               # database handle
+    $sth,               # statement handle
+    @row,               # row returned from select statement
+    
+    %args,              # arguments in calling the script
+    $time,              # time of run
+    $tm,                # reference to localtime hash
+    $interval,          # the expected interval between snapshots in minutes
+    $int_day,		# the interval converted to part of a day
+    $blocksize,         # database block size
+    $tzadjust,          # adjust snapshot timezone by this portion of day
+
+    $out_dir,           # the directory for output
+    $out_file,          # the file to append to ( creates if non-existent )
+    $ts_cnt_file,       # keeps a record of the number of tspaces
+    $prev_snap_file,	# keeps a record of the last snapshot id
+    $prev_snap_id,      # the id of the last snapshot from the previous run
+
+    @snapids,           # a list of snap ids to get stats for
+    @snaptimes,         # the times of these snapshots
+    @instances,         # the numbers of the instances
+    $instance_num,      # the number of a given instance
+    $snapid, $snaptime, # A loop variable to collect the above
+    $endsnap, $endtime, # the number and time of the end snapshot
+    $begsnap, $begtime, # the number and time of the beginning snapshot
+    $elapsec,           # number of seconds between beginning and end
+
+    %val,               # hash for rows from (mostly) sysstat
+    %sgastat,           # hash for rows from stats$sgastat
+    %started,           # the time the instance started
+    %waitcount,         # the number of waits encountered
+    %poolfreesize,      # the bytes of free space in all pools
+    %poolsize,          # the total size of all pools
+    %libgets,           # the number of gets in librarycache
+    %libgethits,        # the number of hits in librarycache
+    %pins,              # the number of pins in librarycache
+    %pinhits,           # the number of pinhits in librarycache
+    %wtwgets,           # the number of willing to wait latch gets
+    %wtwmisses,         # the number of willing to wait latch misses
+    %immgets,           # the number of immediate latch gets
+    %immmisses,         # the number of immediate latch misses
+    %reloads,           # the number of reloads
+    %rollgets,          # the number of gets for rollback segments
+    %rollwaits,         # the number of waits for rollback segments
+
+    $wtwlatchit,	# willing to wait latch hit percentage
+    $immlatchit,	# immediate latch hit percentage
+    $pinhits,		# library pin hit percentage
+    $lgethits,		# library get hit percentage
+    $reload,            # library cache reload percentage
+    $rollcont,          # contention for rollback segs percentage
+    $poolfree,		# pool free percentage
+    $buffnowait,	# buffer no wait success percentage
+    $redonowait,	# redo no wait success percentage
+    $buffhit,		# buffer hit percentage
+    $memsorts,		# sorts in memory percentage
+    $softparse,		# soft parse percentage
+    $extoparse,		# execute to parse percentage
+    $parselcpu,		# parse cpu to parse elapsed percentage
+    $nonparsecpu,	# non parse cpu percentage
+
+    $transactions,      # number of transactions over the period
+    $sessions,          # the actual number of connections current
+    $avgocurs,          # the average number of open cursors
+    $rbckcnt,           # number of rollbacks in the last interval
+    $cmtcnt,            # number of commits in the last interval
+    $redopt,            # redo size per transaction
+    $redops,            # redo size per second
+    $lreadpt,           # number of logical reads per transaction
+    $lreadps,           # number of logical reads per second
+    $bchngpt,           # number of block changes per transaction
+    $bchngps,           # number of block changes per second
+    $preadpt,           # kilobytes read per transaction
+    $preadps,           # kilobytes read per second
+    $pwrtpt,            # kilobytes written per transaction
+    $pwrtps,            # kilobytes written per second
+    $ucalpt,            # number of user calls per transaction
+    $ucalps,            # number of user calls per second
+    $prsept,            # number of parses per transaction
+    $prseps,            # number of parses per second
+    $hprsept,           # number of hard parses per transaction
+    $hprseps,           # number of hard parses per second
+    $sortpt,            # number of sorts per transaction
+    $sortps,            # number of sorts per second
+    $logonpt,           # number of logons per transaction
+    $logonps,           # number of logons per second
+    $exept,             # number of executes per transaction
+    $exeps,             # number of executes per second
+    $reloadpt,          # number of sql area reloads per transaction
+    $reloadps,          # number of sql area reloads per second
+    $tranps,            # number of transactions per second
+
+
+    %ts_size,           # hash of tspace name and size in blocks
+    %ts_extm,           # hash of tspace name and max size if autoextensible
+    %ts_free,           # hash of tspace name and amount free in blocks
+    %ts_pct,            # hash of tspace name and percent used
+    %ts_ext_pct,        # hash of tspace name and percent used if autoextensible
+    $ts,                # a tablespace ( key for above hashes )
+    $ts_max,            # Value of fullest tablespace
+    $ts_ext_max,        # Value of fullest tablespace including autoextensible
+    $ts_tot,            # Used to find average
+    $ts_ext_tot,        # Used to find average
+    $ts_num,            # Used to find average
+    $ts_avg,            # average tablespace usage
+    $ts_ext_avg,        # average tablespace usage including autoextensible
+    $db_free,           # count of free blocks in the database
+    $db_size,           # total size of database
+    $db_ext_size,       # total extensible size of database
+    $datasize,          # the size of actual data
+
+    $colours,           # string of colour codes to display qualitative info
+    $check,$a,$b,       # values for colour comparison
+);
+
+
+$mailids = "oracle\@localhost";
+$dbuser = "orca/orca";
+
+getopts( "ct:i:s:o:", \%args );
+
+unless (@ARGV >= 1) {
+    die "$0: [-i interval] [ -s lastsnap ] [-o out_file] [-t timezoneadjust ] [-c] dbname ";
+}
+$dbname = $ARGV[0];
+
+# Set up time variables
+$tm = localtime();
+
+$ts_cnt_file = "tscount";
+$prev_snap_file = "snapid";
+$out_dir = "/var/orca/orca_oracle/$dbname";
+
+if ( defined $args{'i'} ) {
+    $interval = $args{'i'};
+} else {
+    $interval = 60;
+}
+# convert interval to part of a day
+$int_day = ( ($interval-1)/(24*60) );
+
+if ( defined $args{'s'} ) {
+    $prev_snap_id = $args{'s'};
+} else {
+    $prev_snap_id = get_last_snap( "$out_dir/$prev_snap_file" );
+}
+
+if ( defined $args{'t'} ) {
+    unless ( $args{'t'} =~ /^[+-]?\d+(\.\d+)?$/ ) {
+        die "Invalid timezone adjustment\n";
+    }
+    $tzadjust = $args{'t'};
+    $tzadjust = $tzadjust / 24; # convert to portion of a day
+} else {
+    $tzadjust = 0;
+}
+
+if ( $args{'o'} ) {
+    $out_file = $args{'o'};
+    if ( -w $out_file ) { 
+    } else {
+        if ( open WRITECHK, ">>$out_file" ) {
+         close WRITECHK;
+        }
+    }
+}
+unless ( -w $out_file ) {
+    unless ( stat $out_dir ) {
+        mail_err ( $mailids , "ERR:$0" , "Could not find output directory $out_dir: check existence/permissions\n");
+        die "Could not find output directory $out_dir: check existence/permissions\n";
+    }
+}
+
+# connect to the database
+$dbh = DBI->connect("dbi:Oracle:$dbname", $dbuser, '',
+                                { RaiseError => 1, AutoCommit => 1 });
+unless ( $dbh ) {
+    &mail_err ( $mailids , "ERR:$0" , "Could not connect to $dbname as $dbuser\nError code : $DBI::errstr\n" );
+    die "Could not connect to $dbname as $dbuser\nError code : $DBI::errstr\n" ;
+    }
+        
+#-----------------------------------oO00Oo------------------------------------#
+# Part 1: Decide on beginning and ending snapshots
+
+if ( defined $prev_snap_id ) {
+    ( $snaptime ) = db_one_row ( $dbh,
+		"select to_char ( begin_interval_time + $tzadjust, 'YYYY-MM-DD_HH24:MI:SS' ) 
+		 from sys.wrm\$_snapshot
+		 where snap_id = ?",
+		$prev_snap_id );
+    push( @snapids, $prev_snap_id );
+    push( @snaptimes, $snaptime );
+
+    ( $snapid, $snaptime ) = db_one_row ( $dbh,
+		"select snap_id, to_char ( begin_interval_time + $tzadjust, 'YYYY-MM-DD_HH24:MI:SS' ) 
+		 from sys.wrm\$_snapshot
+		 where snap_id = ( select min(snap_id) from sys.wrm\$_snapshot
+				   where begin_interval_time + $tzadjust > to_date( ? ,  'YYYY-MM-DD_HH24:MI:SS' ) + $int_day)",
+		$snaptime );
+    unless ( defined $snapid ) {
+        &mail_err(  $mailids, "ERR: No new snapshot: $dbname", "Previous snapshot is $prev_snap_id and there is no snapshot more than $interval minutes later\n" );
+        die "Previous snapshot is $prev_snap_id and there is no snapshot more than $interval minutes later\n";
+    } else {
+        if ( defined $args{'c'} ) {
+            while( defined $snapid ) {
+                push( @snapids, $snapid );
+                push( @snaptimes, $snaptime );
+                ( $snapid, $snaptime ) = db_one_row ( $dbh,
+		    "select snap_id, to_char ( begin_interval_time + $tzadjust, 'YYYY-MM-DD_HH24:MI:SS' ) 
+		     from sys.wrm\$_snapshot
+		     where snap_id = ( select min(snap_id) from sys.wrm\$_snapshot
+				   where begin_interval_time > ( select min(begin_interval_time) from sys.wrm\$_snapshot
+							where snap_id = ? ) + $int_day
+				 )",
+    		    $snapids[-1] );
+            }
+        } else {
+            push( @snapids, $snapid );
+            push( @snaptimes, $snaptime );
+        }
+    }
+} else {
+    if ( defined $args{'c'} ) {
+	print "Option 'c' will be ignored as there is no previous snapshot id\n";
+    }
+    # Get the latest snapshot and it's time
+    ( $endsnap, $endtime ) = db_one_row ( $dbh, 
+		"select snap_id, to_char ( begin_interval_time + $tzadjust, 'YYYY-MM-DD_HH24:MI:SS' ) 
+		 from sys.wrm\$_snapshot
+		 where snap_id = ( select max(snap_id) from sys.wrm\$_snapshot 
+				 )" );
+
+    # Then snapshot one interval earlier
+    ( $begsnap, $begtime ) = db_one_row ( $dbh,
+		"select snap_id, to_char ( begin_interval_time + $tzadjust, 'YYYY-MM-DD_HH24:MI:SS' ) 
+	         from sys.wrm\$_snapshot
+		 where snap_id = ( select max(snap_id) from sys.wrm\$_snapshot
+		                   where begin_interval_time + $tzadjust < to_date(?, 'YYYY-MM-DD_HH24:MI:SS') - $int_day
+				 )",
+		$endtime );
+		
+    @snapids = ( $begsnap, $endsnap );
+    @snaptimes = ( $begtime, $endtime );
+}
+
+
+# Now find out what instances we have
+
+$sth = $dbh->prepare ( "select distinct instance_number from sys.wrm\$_snapshot
+                        where snap_id >= ?
+                        order by instance_number" );
+$sth->execute( $snapids[0] );
+while ( @row = $sth->fetchrow ) {
+        push( @instances, $row[0] );
+}
+
+#-----------------------------------oO00Oo------------------------------------#
+# Part 2: Collect the raw values from the database
+
+# First the simple ones which return one row
+
+# db block size
+( $blocksize ) = db_one_row ( $dbh,
+		 "select value from sys.v_\$parameter where
+                        name = 'db_block_size' " );
+
+foreach $snapid ( @snapids ) {
+  foreach $instance_num ( @instances ) {
+    # Instance start time
+    ( $started{ $snapid }{ $instance_num } ) = db_one_row ( $dbh,
+		 "select to_char ( startup_time + $tzadjust, 'YYYY-MM-DD_HH24:MI:SS' ) from sys.wrm\$_snapshot 
+			where instance_number = ? and 
+			snap_id = (select max(snap_id)
+			           from sys.wrm\$_snapshot 
+			           where snap_id <= ? and instance_number = ?)",
+		$instance_num, $snapid, $instance_num );
+
+    # Wait Count
+    ( $waitcount{ $snapid }{ $instance_num } ) = db_one_row ( $dbh,
+		 "select sum(wait_count) from sys.wrh\$_waitstat where snap_id = ? and instance_number = ?",
+		$snapid, $instance_num );
+    
+    # Pool Free
+    ( $poolfreesize{ $snapid }{ $instance_num } ) = db_one_row ( $dbh,
+		 "select sum(bytes) from sys.wrh\$_sgastat
+    	                where snap_id = ? and instance_number = ?
+    	                and pool in ('shared pool','all pools') 
+                            and name = 'free memory'",
+		$snapid, $instance_num );
+    
+    # Pool Size
+    ( $poolsize{ $snapid }{ $instance_num } ) = db_one_row ( $dbh,
+		 "select sum(bytes) from sys.wrh\$_sgastat
+    	                where snap_id = ? and instance_number = ?
+    	                and pool in ('shared pool','all pools')",
+		$snapid, $instance_num );
+    
+    # Library Hit
+    ( $libgets{ $snapid }{ $instance_num }, 
+    $libgethits{ $snapid }{ $instance_num }, 
+    $pins{ $snapid }{ $instance_num }, 
+    $pinhits{ $snapid }{ $instance_num }, 
+    $reloads{ $snapid }{ $instance_num } ) =
+    			db_one_row ( $dbh,
+		 "select sum(gets), sum(gethits), sum(pins), sum(pinhits), sum(reloads)
+				from sys.wrh\$_librarycache where snap_id = ? and instance_number = ?",
+		$snapid, $instance_num );
+    
+    # Latch Hit
+    ( $wtwgets{ $snapid }{ $instance_num },
+    $wtwmisses{ $snapid }{ $instance_num },
+    $immgets{ $snapid }{ $instance_num },
+    $immmisses{ $snapid }{ $instance_num } ) =
+    			db_one_row ( $dbh,
+		 "select sum(gets), sum(misses), sum(immediate_gets), sum(immediate_misses)
+			    from sys.wrh\$_latch where snap_id = ? and instance_number = ?",
+		$snapid, $instance_num );
+    
+##DCL## - wrh$_rollstat only seems to exist if rollback segments are present
+##    # Rollback Contention 
+##    ( $rollgets{ $snapid }{ $instance_num }, $rollwaits{ $snapid }{ $instance_num } ) = 
+##    			db_one_row ( $dbh,
+##		 "select sum(gets), sum(waits) from stats\$rollstat where snap_id = ? and instance_number = ?",
+##		$snapid, $instance_num );
+    
+    # Data from stats$sgastat
+    $sth = $dbh->prepare ( "select name, bytes from sys.wrh\$_sgastat
+                            where snap_id = ? and instance_number = ?
+                            and pool = 'shared pool' and name in 
+                            ( 'free memory', 'sql area', 'library cache' )" );
+    $sth->execute( $snapid, $instance_num );
+    while ( @row = $sth->fetchrow ) {
+        $sgastat{ $snapid }{ $instance_num }{ $row[0] } = $row[1];
+    }
+
+    # Finally, the values interpreted from sysstat
+    $sth = $dbh->prepare ( "select nm.stat_name, st.value from sys.wrh\$_sysstat st 
+                            inner join sys.wrh\$_stat_name nm on st.stat_id = nm.stat_id
+                            where snap_id = ? and instance_number = ? and nm.stat_name in 
+     ( 'CPU used by this session', 'db block changes', 'execute count',
+       'logons current', 'logons cumulative', 'opened cursors current',
+       'parse count (hard)',
+       'parse count (total)', 'parse time cpu', 'parse time elapsed',
+       'physical reads direct (lob)', 'physical reads direct', 'physical reads',
+       'physical writes', 'redo entries', 'redo log space requests', 'redo size',
+       'session logical reads', 'sorts (disk)', 'sorts (memory)', 'user calls',
+       'user commits', 'user rollbacks'
+     )" );
+    $sth->execute( $snapid, $instance_num );
+    while ( @row = $sth->fetchrow ) {
+        $val{ $snapid }{ $instance_num }{ $row[0] } = $row[1];
+    }
+  }
+}
+
+# Now collect the raw data on tablespace sizes
+
+$sth = $dbh->prepare ( "select tablespace_name, sum(blocks),
+                        sum( decode( maxblocks, 0, blocks, maxblocks ) )
+                        from sys.dba_data_files group by tablespace_name
+			union
+			select tablespace_name, sum(blocks),
+                        sum( decode( maxblocks, 0, blocks, maxblocks ) )
+                        from sys.dba_temp_files group by tablespace_name" );
+$sth->execute;
+while ( @row = $sth->fetchrow ) {
+    $ts_size{ $row[0] } = $row[1];
+    $ts_extm{ $row[0] }  = $row[2];
+}
+
+$sth = $dbh->prepare ( "select tablespace_name, sum(blocks) 
+                        from sys.dba_free_space group by tablespace_name
+			union
+			select t.tablespace_name, sum(t.blocks_free + s.free_blocks)
+			from sys.v_\$sort_segment s, sys.v_\$temp_space_header t
+			where t.tablespace_name = s.tablespace_name (+)
+			group by t.tablespace_name" );
+$sth->execute;
+while ( @row = $sth->fetchrow ) {
+    $ts_free{ $row[0] } = $row[1];
+}
+
+$dbh->disconnect;
+
+#-----------------------------------oO00Oo------------------------------------#
+# Part 3: Evaluate the performance values based on stats collected
+
+# i. Tablespace % full
+foreach $ts ( keys %ts_size ) {
+    # calculate percentages
+    $ts_pct{ $ts } = 100 * ( 1 - $ts_free{ $ts } / $ts_size{ $ts } );
+    $ts_ext_pct{ $ts } = 100 * ( $ts_size{ $ts } - $ts_free{ $ts } )
+                                                   / $ts_extm{ $ts };
+
+    # resize to Mbytes
+    $ts_free{ $ts } = $ts_free{ $ts } * $blocksize
+                           / 1024 / 1024 ;
+    $ts_size{ $ts } = $ts_size{ $ts } * $blocksize
+                           / 1024 / 1024 ;
+    $ts_extm{ $ts } = $ts_extm{ $ts } * $blocksize
+                           / 1024 / 1024 ;
+
+    # caclulate total sizes
+    $db_size += $ts_size{ $ts };
+    $db_free += $ts_free{ $ts };
+    $db_ext_size += $ts_extm{ $ts };
+}
+$datasize = $db_size - $db_free;
+
+$ts_max = 0;
+$ts_tot = 0;
+$ts_ext_max = 0;
+$ts_ext_tot = 0;
+foreach $ts ( keys %ts_pct ) {
+    $ts_tot += $ts_pct{ $ts };
+    $ts_ext_tot += $ts_ext_pct{ $ts };
+    next if ( $ts =~ /TMP|TEMP|ROLL|RBS/ );
+    $ts_max = $ts_pct{ $ts } > $ts_max ? $ts_pct{ $ts } : $ts_max ;
+    $ts_ext_max = $ts_ext_pct{ $ts } > $ts_ext_max ? 
+                                 $ts_ext_pct{ $ts } : $ts_ext_max ;
+}
+eval {
+    $ts_num = keys ( %ts_size);
+    $ts_avg = $ts_tot / $ts_num;
+    $ts_ext_avg = $ts_ext_tot / $ts_num;
+};
+
+
+while ( $#snapids > 0 ) {
+    $begsnap = shift( @snapids );
+    $begtime = shift( @snaptimes );
+
+    $endsnap = $snapids[0];
+    $endtime = $snaptimes[0];
+  foreach $instance_num ( @instances ) {
+    unless ( $started{ $endsnap }{ $instance_num } eq $started{ $begsnap }{ $instance_num } ) {
+        &mail_err ( $mailids , "Instance Restarted: $dbname",  "The instance $dbname was restarted between snapshots $begsnap and $endsnap\n" );
+        next;
+    }
+    $elapsec = epoch_seconds( $endtime ) - epoch_seconds( $begtime );
+
+    # ii. values based on the end time only
+
+    eval {
+    $poolfree = 100*( $poolfreesize{$endsnap}{ $instance_num }
+    		          / $poolsize{$endsnap}{ $instance_num }
+                    );
+    };
+
+    eval {
+    $sessions = $val{$endsnap}{ $instance_num }{'logons current'};
+    };
+
+    eval {
+    $avgocurs = $val{$endsnap}{ $instance_num }{'opened cursors current'}
+			/ $val{$endsnap}{ $instance_num }{'logons current'};
+    };
+
+    # iii. values based on the change over the period between snaps
+ 
+    eval {
+    $wtwlatchit = 100*(1 - ( ( $wtwmisses{$endsnap}{ $instance_num } - $wtwmisses{$begsnap}{ $instance_num } )
+    		          / ( $wtwgets{$endsnap}{ $instance_num } - $wtwgets{$begsnap}{ $instance_num } ) )
+                    );
+    };
+    
+    eval {
+    $immlatchit = 100*(1 - ( ( $immmisses{$endsnap}{ $instance_num } - $immmisses{$begsnap}{ $instance_num } )
+    		          / ( $immgets{$endsnap}{ $instance_num } - $immgets{$begsnap}{ $instance_num } ) )
+                    );
+    };
+    
+    ##eval {
+    ##$rollcont = 100*( ( $rollwaits{$endsnap}{ $instance_num } - $rollwaits{$begsnap}{ $instance_num } )
+    ##		          / ( $rollgets{$endsnap}{ $instance_num } - $rollgets{$begsnap}{ $instance_num } )
+    ##                );
+    ##};
+    
+    eval {
+    $pinhits = 100*( ( $pinhits{$endsnap}{ $instance_num } - $pinhits{$begsnap}{ $instance_num } )
+    		          / ( $pins{$endsnap}{ $instance_num } - $pins{$begsnap}{ $instance_num } )
+                    );
+    };
+    
+    eval {
+    $lgethits = 100*( ( $libgethits{$endsnap}{ $instance_num } - $libgethits{$begsnap}{ $instance_num } )
+    		          / ( $libgets{$endsnap}{ $instance_num } - $libgets{$begsnap}{ $instance_num } )
+                    );
+    };
+    
+    eval {
+    $reload = 100*( ( $reloads{$endsnap}{ $instance_num } - $reloads{$begsnap}{ $instance_num } )
+    		          / ( $pins{$endsnap}{ $instance_num } - $pins{$begsnap}{ $instance_num } )
+                    );
+    };
+    
+    eval {
+    $buffnowait = 100*( 1 - ( ( $waitcount{$endsnap}{ $instance_num } - $waitcount{$begsnap}{ $instance_num } )
+    		          / valdiff( $endsnap, $begsnap, $instance_num, \%val, 'session logical reads' ) )
+                    );
+    };
+    
+    eval {
+    $redonowait = 100*( 1 - ( valdiff( $endsnap, $begsnap, $instance_num, \%val, 'redo log space requests' )
+    		          / valdiff( $endsnap, $begsnap, $instance_num, \%val, 'redo entries' ) )
+                    );
+    };
+    
+    eval {
+    $buffhit = 100*( 1 -  ( valdiff( $endsnap, $begsnap, $instance_num, \%val, 'physical reads' )
+    			-  valdiff( $endsnap, $begsnap, $instance_num, \%val, 'physical reads direct' )
+    			-  valdiff( $endsnap, $begsnap, $instance_num, \%val, 'physical reads direct (lob)' )
+    		      ) / valdiff( $endsnap, $begsnap, $instance_num, \%val, 'session logical reads' )
+    	       );
+    
+    };
+    
+    eval {
+    $memsorts = 100*( valdiff( $endsnap, $begsnap, $instance_num, \%val, 'sorts (memory)' ) 
+    	          / ( valdiff( $endsnap, $begsnap, $instance_num, \%val, 'sorts (memory)' )
+    	              + valdiff( $endsnap, $begsnap, $instance_num, \%val, 'sorts (disk)' )
+    		    )
+                    );
+    };
+    
+    eval {
+    $softparse = 100*(1 - ( valdiff( $endsnap, $begsnap, $instance_num, \%val, 'parse count (hard)' )
+    		          / valdiff( $endsnap, $begsnap, $instance_num, \%val, 'parse count (total)' ) )
+                    );
+    };
+    
+    eval {
+    $extoparse = 100*( 1 - ( valdiff( $endsnap, $begsnap, $instance_num, \%val, 'parse count (total)' )
+    		          / valdiff( $endsnap, $begsnap, $instance_num, \%val, 'execute count' ) )
+                    );
+    };
+    
+    eval {
+    $parselcpu = 100*( valdiff( $endsnap, $begsnap, $instance_num, \%val, 'parse time cpu' )
+    		          / valdiff( $endsnap, $begsnap, $instance_num, \%val, 'parse time elapsed' )
+                    );
+    };
+    
+    eval {
+    $nonparsecpu = 100*( 1 - ( valdiff( $endsnap, $begsnap, $instance_num, \%val, 'parse time cpu' )
+    		          / valdiff( $endsnap, $begsnap, $instance_num, \%val, 'CPU used by this session' ) )
+                    );
+    };
+
+    # iv. Numbers which aren't percentages
+
+    eval {
+    $rbckcnt = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'user rollbacks' );
+    };
+    
+    eval {
+    $cmtcnt = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'user commits' );
+    };
+    
+    eval {
+    $transactions =  $rbckcnt + $cmtcnt;
+    };
+    
+    eval {
+    $redopt = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'redo size' )
+			/ $transactions;
+    $redops = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'redo size' )
+			/ $elapsec;
+    };
+    
+    eval {
+    $lreadpt = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'session logical reads' )
+			/ $transactions;
+    $lreadps = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'session logical reads' )
+			/ $elapsec;
+    };
+    
+    eval {
+    $bchngpt = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'db block changes' )
+			/ $transactions;
+    $bchngps = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'db block changes' )
+			/ $elapsec;
+    };
+    
+    eval {
+    $preadpt = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'physical reads' )
+		    * $blocksize / 1024 / $transactions;
+    $preadps = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'physical reads' )
+		    * $blocksize / 1024 / $elapsec;
+    };
+    
+    eval {
+    $pwrtpt = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'physical writes' )
+		    * $blocksize / 1024 / $transactions;
+    $pwrtps = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'physical writes' )
+		    * $blocksize / 1024 / $elapsec;
+    };
+    
+    eval {
+    $ucalpt = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'user calls' )
+			/ $transactions;
+    $ucalps = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'user calls' )
+			/ $elapsec;
+    };
+    
+    eval {
+    $prsept = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'parse count (total)' )
+			/ $transactions;
+    $prseps = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'parse count (total)' )
+			/ $elapsec;
+    };
+    
+    eval {
+    $hprsept = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'parse count (hard)' )
+			/ $transactions;
+    $hprseps = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'parse count (hard)' )
+			/ $elapsec;
+    };
+    
+    eval {
+    $sortpt = ( valdiff( $endsnap, $begsnap, $instance_num, \%val, 'sorts (memory)' )
+		+ valdiff( $endsnap, $begsnap, $instance_num, \%val, 'sorts (disk)' )
+		      ) / $transactions;
+    $sortps = ( valdiff( $endsnap, $begsnap, $instance_num, \%val, 'sorts (memory)' )
+		+ valdiff( $endsnap, $begsnap, $instance_num, \%val, 'sorts (disk)' )
+		      ) / $elapsec;
+    };
+    
+    eval {
+    $logonpt = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'logons cumulative' )
+			/ $transactions;
+    $logonps = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'logons cumulative' )
+			/ $elapsec;
+    };
+
+    eval {
+    $exept = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'execute count' )
+			/ $transactions;
+    $exeps = valdiff( $endsnap, $begsnap, $instance_num, \%val, 'execute count' )
+			/ $elapsec;
+    };
+    
+    eval {
+    $reloadpt = (($reloads{$endsnap}{ $instance_num } - $reloads{$begsnap}{ $instance_num } )
+    		          / $transactions );
+    };
+
+    eval {
+    $reloadps = (($reloads{$endsnap}{ $instance_num } - $reloads{$begsnap}{ $instance_num } )
+        		          / $elapsec );
+    };
+        
+    
+    eval {
+    $tranps = $transactions / $elapsec;
+    };
+        
+    #-----------------------------------oO00Oo------------------------------------#
+    # Part 4: Write the results out to file
+    
+    unless ( defined $args{'o'} ) {
+        $out_file = set_outfile( $out_dir, $endtime, $ts_num, $ts_cnt_file, $dbname, $instance_num );
+    }
+
+    unless ( open OUT, ">> $out_file" ) {
+        &mail_err ( $mailids , "ERR:$0",  "Can't write $out_file : $!\n" ),
+        die "Can't write $out_file : $!"
+    };
+    
+    if ( -z $out_file ) {
+        ##print OUT "endtime locltime endsnap timespan started shpoolfree sqlareasize shlibcache poolfree wtwlatchit immlatchit pinhits lgethits reload rollcont buffnowait redonowait buffhit memsorts softparse extoparse parselcpu nonparsecpu transactions sessions avgocurs rbckcnt cmtcnt redopt redops lreadpt lreadps bchngpt bchngps preadpt preadps pwrtpt pwrtps ucalpt ucalps prsept prseps hprsept hprseps sortpt sortps logonpt logonps exept exeps reloadpt reloadps tranps tsmax tsavg tsxmax tsxavg maxdbsize dbsize datasize";
+        print OUT "endtime locltime endsnap timespan started shpoolfree sqlareasize shlibcache poolfree wtwlatchit immlatchit pinhits lgethits reload buffnowait redonowait buffhit memsorts softparse extoparse parselcpu nonparsecpu transactions sessions avgocurs rbckcnt cmtcnt redopt redops lreadpt lreadps bchngpt bchngps preadpt preadps pwrtpt pwrtps ucalpt ucalps prsept prseps hprsept hprseps sortpt sortps logonpt logonps exept exeps reloadpt reloadps tranps tsmax tsavg tsxmax tsxavg maxdbsize dbsize datasize";
+        foreach $ts ( sort keys %ts_pct ) {
+            print OUT " TSPCT.$ts TSXPCT.$ts TSUMB.$ts TSSMB.$ts TSXMB.$ts";
+        }
+        print OUT "\n";
+    }
+    
+    
+    # print it all out
+    #printf OUT "$time %02d:%02d:%02d", 
+    #        $tm->hour, $tm->min, $tm->sec ;
+    
+    printf OUT "%d ", epoch_seconds( $endtime );
+    printf OUT "%s ", $endtime;
+    printf OUT "%d ", $endsnap;
+    printf OUT "%d ", $elapsec;
+    
+    printf OUT "%s", $started{ $endsnap }{ $instance_num };
+    #printf OUT " %s", $colours;
+    printf OUT " %0.2f %0.2f %0.2f",
+    	$sgastat{ $endsnap }{ $instance_num }{ 'free memory' },
+    	$sgastat{ $endsnap }{ $instance_num }{ 'sql area' },
+    	$sgastat{ $endsnap }{ $instance_num }{ 'library cache' };
+    printf OUT " %0.2f %0.2f %0.2f %0.2f %0.2f %0.2f",
+    	$poolfree, $wtwlatchit, $immlatchit, $pinhits, $lgethits, $reload;
+    ## printf OUT " %0.2f %0.2f %0.2f %0.2f %0.2f",
+    ##        	 $rollcont, $buffnowait, $redonowait, $buffhit, $memsorts;
+    printf OUT " %0.2f %0.2f %0.2f %0.2f",
+           	 $buffnowait, $redonowait, $buffhit, $memsorts;
+    printf OUT " %0.2f %0.2f %0.2f %0.2f",
+             $softparse, $extoparse, $parselcpu, $nonparsecpu;
+    printf OUT " %d %d %0.2f %d %d",
+             $transactions, $sessions, $avgocurs, $rbckcnt, $cmtcnt;
+    printf OUT " %0.2f %0.2f %0.2f %0.2f %0.2f %0.2f",
+             $redopt, $redops, $lreadpt, $lreadps, $bchngpt, $bchngps;
+    printf OUT " %0.2f %0.2f %0.2f %0.2f %0.2f %0.2f",
+             $preadpt, $preadps, $pwrtpt, $pwrtps, $ucalpt, $ucalps;
+    printf OUT " %0.2f %0.2f %0.2f %0.2f %0.2f %0.2f",
+             $prsept, $prseps, $hprsept, $hprseps, $sortpt, $sortps;
+    printf OUT " %0.2f %0.2f %0.2f %0.2f %0.2f %0.2f %0.2f",
+             $logonpt, $logonps, $exept, $exeps, $reloadpt, $reloadps, $tranps;
+    printf OUT " %0.2f %0.2f %0.2f %0.2f",
+            $ts_max, $ts_avg, $ts_ext_max, $ts_ext_avg;
+    printf OUT " %0.2f %0.2f %0.2f",
+            $db_ext_size, $db_size, $datasize;
+    
+    foreach $ts ( sort keys %ts_pct ) {
+        printf OUT " %0.2f %0.2f %0.2f %0.2f %0.2f",
+               $ts_pct{ $ts }, $ts_ext_pct{ $ts }, $ts_size{ $ts } - $ts_free{ $ts },
+               $ts_size{ $ts }, $ts_extm{ $ts };
+    }
+    print OUT "\n";
+    
+    close OUT;
+  }
+}
+
+put_last_snap( "$out_dir/$prev_snap_file", $endsnap );
+
+#-----------------------------------oO00Oo------------------------------------#
+# Subs
+
+
+# orca can't cope if the number of fields differs from the number of headers
+# but it can accept multiple files.  Only likely change is count of tablespaces
+# so start a new file if this changes.
+
+sub set_outfile {
+    my ( $out_dir, $ftime, $ts_now, $cnt_file, $dbname , $instid ) = ( @_ );
+
+    my (
+        $out_file,          # the file name to be returned, built up in parts
+        $out_suffix,        # suffix so that multiple files per day are possible
+        $line,              # used to read count file
+        $ts_was,            # value from count file
+        $ts_check,          # difference between current value and old value
+        $ts_suffix,         # starts with 00 for the day
+        $out_glob,          # convert $out_file to a file glob
+        @files,             # glob of files matching out file format
+        $files,             # count of @files
+        $fdate,             # the date part of the time passed in
+    );
+
+    $fdate = $ftime;
+    $fdate =~ s/_.*//;
+
+    #  base format
+    $out_file = "$out_dir/orca_oracle-i$instid-$fdate";
+
+    # check if any files created today.  If not, suffix is 00
+    $out_glob = $out_file . ".*";
+
+    @files = glob( "$out_glob" );
+
+#print "file count is $#files \n";
+    if ( $#files < 0 ) {
+        $out_file.= ".00";
+        return ( $out_file );
+    }
+
+    # have established count of files for day
+    $cnt_file = "$out_dir/$cnt_file.$dbname.$instid";
+
+#print "count file ins $cnt_file \n";
+
+    # try to open the file.  Don't complain if it doesn't exist
+    if ( open TS_CNT, $cnt_file ) {
+    
+        # Get the last data line
+        while ( defined ($line = <TS_CNT>) ) {
+            next if $line =~ /^#/;
+            chomp $line;
+            $line =~ s/^\s*//;
+            $line =~ s/\s*$//;
+            next if $line =~ /^$/;
+            next if $line !~ /\d/;
+            $ts_was = $line;
+        }
+        close TS_CNT;
+        $ts_check = $ts_now - $ts_was;
+    }
+
+    # If the number has changed
+    if ( $ts_check == 0 ) {
+        $ts_suffix = $#files;
+    }
+    else {
+        $ts_suffix = $#files + 1;
+    }
+
+#print "ts_check = ts_now - ts_was  is $ts_check = $ts_now - $ts_was \n";
+
+    # if the file didn't exist, or the information has changed
+    if ( ! defined ( $ts_was ) || $ts_check > 0 ) {
+
+        # update file info
+        unless ( open TS_CNT, ">> $cnt_file" ) {
+            &mail_err ( $mailids , "ERR:$0",  "Can't write $cnt_file : $!\n" ),
+        }
+        print TS_CNT "# $ftime \n";
+        print TS_CNT "$ts_now\n";
+        close TS_CNT;
+    }
+
+    # set the suffix value to one greater than before
+    $ts_suffix = sprintf "%02d", $ts_suffix;
+    $out_file.= "." . $ts_suffix;
+
+    return ( $out_file );
+
+}
+
+sub db_one_row {
+    my ( $dbh, $statement, @pars ) = ( @_ );
+    my ( $sth, @row );
+    $sth = $dbh->prepare ( $statement );
+    $sth->execute( @pars );
+    @row = $sth->fetchrow;
+    $sth->finish;
+    return( @row );
+}
+
+sub get_last_snap {
+    my ( $file ) = ( @_ );
+    my ( $line, $ret );
+    open( SFILE, $file ) or return undef;
+
+    # Get the last data line
+    while ( defined ($line = <SFILE>) ) {
+        next if $line =~ /^#/;
+        chomp $line;
+        $line =~ s/^\s*//;
+        $line =~ s/\s*$//;
+        next if $line =~ /^$/;
+        next if $line !~ /\d/;
+        $ret = $line;
+    }
+    close SFILE;
+    return( $ret );
+}
+
+sub put_last_snap {
+    my ( $file, $num ) = ( @_ );
+
+    open( SFILE, ">>$file" ) or die "Can't write to $file !";
+    print SFILE "$num\n";
+    close SFILE;
+}
+
+sub valdiff {
+    my ( $end, $beg, $inst, $vals, $value ) = ( @_ );
+
+    return( $$vals{$end}{$inst}{$value} - $$vals{$beg}{$inst}{$value} );
+}
+
+sub epoch_seconds {
+    use Time::Local;
+    # convert 'YYYY-MM-DD_HH24:MI:SS' to epoch seconds
+    my ( $date_string ) = ( @_ );
+    my ( $yyyy, $mm, $dd, $hh, $mi, $ss ) = ( $date_string =~ /(\d+)-(\d+)-(\d+)_(\d+):(\d+):(\d+)/ );
+    return ( timegm( $ss, $mi, $hh, $dd, $mm-1, $yyyy ) );
+}
+
+
+#-----------------------------------oO00Oo------------------------------------#
+# Simple mailer - pipe to /bin/mail
+
+sub mail_err {
+
+    my  ($mailids  ,
+         $title ,
+         $err ,
+    );
+
+    $mailids = $_[0];
+    $title = $_[1];
+    $err = $_[2];
+
+    open (MAIL, "|/bin/mail $mailids" );
+    print MAIL "Subject: $title\n\n";
+    print MAIL "$err\n";
+    close MAIL;
+
+} # end mail_err
+
+
