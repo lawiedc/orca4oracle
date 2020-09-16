@@ -1,0 +1,635 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN">
+<html>
+<head>
+  <title>Statspack, Orca and Oracle Database Tuning Statistics</title>
+
+</head>
+<div id="content">
+<body>
+<h1>
+Statspack, Orca and Oracle Database Tuning Statistics</h1>
+Historically, statistics for Oracle databases tended to be taken since
+instance
+start-up. This was reasonable in the days where databases were shut
+down
+regularly for maintenance. However, with hot backups and 24x7
+operations, an average figure over the life-time of the instance
+doesn't say very much about what it has been up to lately. Oracle's
+introduction of statspack with 8.1.6
+recognised this. Statspack is capable of collecting and displaying a
+great
+deal of useful and detailed information. There is a cost in space
+within the
+database, though, whilst getting an overview from a pile of statspack
+text
+files is also difficult.
+<p>Orca graphing can help to provide that overview. It is not a
+substitute for
+understanding the statspack reports, but can help with deciding which
+ones to
+read. As orca uses rrds to hold it's data, it can retain headline
+figures in the long term without consuming an excessive amount of
+space. This
+helps in understanding long term trends.
+</p>
+<p>The statistics graphed here are almost all extracted from the
+statspack tables
+and derived in the same manner as the data in a text based statspack
+snapshot.
+</p>
+<h3>orca_oracle</h3>
+For the orca_oracle "collection agent" and the cfg files for orca, see 
+<github class="com">
+<lawiedc>
+<orca4oracle></orca4oracle>
+<p>The change log for orca_oracle is as follows:
+</p>
+<pre>
+CHANGES                                            DATE
+Initial Version                                    August    1999
+Add in support for changing number of data columns October   1999
+First attempt to rewrite to use perfstat data      September 2003
+Implementation of fully perfstat-based collection  May       2004
+                             -- effectively v2.0
+Correct free space accounting for temp tspaces     November  2004
+Get stats for current instance correctly in RAC
+  also, output shared sql area and free memory     January   2005
+Output raw value for reloads per sec               February  2005
+Correct bug in gathering instance start time       May       2005
+Upgrade to Oracle 10, and assume RAC               April     2006
+                             -- orca_oracle for 9i becomes "maintenance only"
+Fix bug in snapshot selection for instance > 1     April     2006
+Add option to adjust timezone of snapshots         May       200
+
+</pre>
+<h3>Note on Pseudo Code</h3>
+As these statistics tend to be derived from statspack, most of them are
+dependent on the changes in certain counters over the period. To
+indicate
+this, there is the pesudocode entry
+<pre>valdiff( table, name )<br>valdiff = value at end snap in table where name equals given endsnap<br>	  - value in table at begin snap where name equals given endsnap<br></pre>
+<h2>Contents</h2>
+<h3>Ratios</h3>
+The first section is ratios, but no ratio is meaningful of itself.
+As Oracle say "Database tuning never must be driven by hit ratios. They
+only provide additional information to understand how the
+instance is operating." (MetaLink note 228913.1)
+<p>A step towards monitoring actual values is taken with the <a
+ href="#sqlarea">SQL Area Size</a> graph, which shows actual values.
+Otherwise, the most relevant instance parameters are listed with each
+parameter.
+</p>
+<ul>
+  <li>
+    <a href="#buffhit">Buffer Cache Hit Ratio</a></li>
+  <li>
+    <a href="#memsorts">Sorts in Memory</a></li>
+  <li>
+    <a href="#sqlarea">SQL Area Size</a></li>
+  <li>
+    <a href="#shpool">Shared Pool</a></li>
+  <li>
+    <a href="#lchits">Library Cache Hits</a></li>
+  <li>
+    <a href="#wtpct">Wait Percentages</a></li>
+  <li>
+    <a href="#nonparsecpu">Non-Parse CPU</a></li>
+  <li>
+    <a href="#parse">Parsing</a></li>
+  <li>
+    <a href="#latches">Latches</a></li>
+  <li>
+    <a href="#rollcont">Rollback Segment Contention</a></li>
+</ul>
+<h3>Counters</h3>
+<h4>Over the Interval</h4>
+The first few values are totals for the monitoring interval.
+<ul>
+  <li>
+    <a href="#transactions">Total Transactions over interval</a></li>
+  <li>
+    <a href="#sessions">Total Sessions over interval</a></li>
+  <li>
+    <a href="#tranps">Transactions per Second</a></li>
+  <li>
+    <a href="#avgocurs">Average Open Cursors</a></li>
+  <li>
+    <a href="#randc">Rollbacks and Commits</a></li>
+</ul>
+<h4>Per Second and Per Transaction</h4>
+The remaining counters give average values per second and per
+transaction.
+This will tend to flatten the smaller value if your site has a very
+different profile between actions per second and actions per
+transaction.
+<ul>
+  <li>
+    <a href="#redo">Redo Size</a></li>
+  <li>
+    <a href="#logreads">Logical Reads</a></li>
+  <li>
+    <a href="#bchng">Block Changes</a></li>
+  <li>
+    <a href="#phyreads">Physical Reads</a></li>
+  <li>
+    <a href="#phywrts">Physical Writes</a></li>
+  <li>
+    <a href="#ucalls">User Calls</a></li>
+  <li>
+    <a href="#pcount">Parse Count</a></li>
+  <li>
+    <a href="#hpcount">Hard Parse Count</a></li>
+  <li>
+    <a href="#scount">Sort Count</a></li>
+  <li>
+    <a href="#lcount">Logons Count</a></li>
+  <li>
+    <a href="#exes">Executes</a></li>
+  <li>
+    <a href="#reloadps">Reloads per Second</a></li>
+</ul>
+<h3>Tablespace Information</h3>
+<ul>
+  <li>
+    <a href="#dbsize">Database Size</a></li>
+  <li>
+    <a href="#tspace">Max &amp; Mean Tablespace Percent Full</a></li>
+</ul>
+<h2>
+<a name="buffhit"></a>Buffer Cache Hit Ratio</h2>
+<pre>100*( 1 -  ( valdiff( stats$sysstat, 'physical reads' )<br>             -  valdiff( stats$sysstat, 'physical reads direct' )<br>             -  valdiff( stats$sysstat, 'physical reads direct (lob)' )<br>           ) / valdiff( stats$sysstat, 'session logical reads' )<br>     );<br></pre>
+The buffer cache hit ratio is a measure of the proportion of requests
+for
+data which is satisfied by data already in the buffer cache. Higher
+ratios are better as access to data in memory is speedier than an IO
+operation
+to disk. There comes a point of diminishing returns when increasing
+the size of the database buffer. Also, remember that this is part
+of the SGA and it may be more important to use additional memory for
+other
+parts of the SGA. It is vital that the whole SGA fits within main
+memory,
+as paging of the SGA is disastrous for performance.
+<p>
+<table border="1" cols="2" width="50%">
+  <tbody>
+    <tr>
+      <td>Optimum</td>
+      <td>High</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>DB_BLOCK_BUFFERS</td>
+    </tr>
+  </tbody>
+</table>
+</p>
+<h2><a name="memsorts"></a>Sorts in Memory</h2>
+<pre> 100*( valdiff( stats$sysstat, 'sorts (memory)' )<br>		  / ( valdiff( stats$sysstat, 'sorts (memory)' )<br>		      + valdiff( stats$sysstat, 'sorts (disk)' )<br>                    )<br>     )<br></pre>
+This is a measure of the proportion of data sorts which occur within
+memory
+rather than on disk. Sorts on disk make use of the user's tempoary
+table space. The maximum size of sort which will occur in memory
+is defined by the sort area size, which is the size within the PGA
+which
+will be used. Each Oracle process which sorts will allocate this
+much memory, though it may not need all of it. Use of memory for
+this purpose reduces that available to the SGA.
+<p>
+<table border="1" cols="2" width="50%">
+  <tbody>
+    <tr>
+      <td>Optimum</td>
+      <td>High</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>SORT_AREA_SIZE</td>
+    </tr>
+  </tbody>
+</table>
+</p>
+<h2><a name="sqlarea"></a>SQL Area Size</h2>
+This graph stacks two values
+<h3>SQL Area</h3>
+<pre>select bytes from stats$sgastat<br>where snap_id = endsnap <br>and pool = 'shared pool'<br>and name = 'sql area'<br></pre>
+<h3>Shared Pool Free</h3>
+<pre>select bytes from stats$sgastat<br>where snap_id = endsnap <br>and pool = 'shared pool'<br>and name = 'free memory'<br></pre>
+<p>
+The current amount of space occupied by the SQL Area can vary
+dramatically, dependent on
+current usage levels. However, the sum of used SQL Area and free memory
+is likely to be
+less volatile. This sum needs to be sufficient for all currently
+required parsed SQL.
+Note that this graph cannot indicate whether space is fragmented.
+</p>
+<h2><a name="shpool"></a>Shared Pool</h2>
+This graph includes two figures
+<h3><a name="poolfree"></a>Shared Pool Free</h3>
+<pre>100*<br> select sum(bytes) from stats$sgastat<br> where snap_id = endsnap <br> and pool in ('shared pool','all pools')<br> and name = 'free memory'<br>/<br> select sum(bytes) from stats$sgastat<br> where snap_id = endsnap<br> and pool in ('shared pool','all pools')<br></pre>
+The percentage of the shared pool not currently in use. If a large
+proportion of the shared pool is always free, it is likely that the
+size
+of the shared pool can be reduced. Low free values are not a cause
+for concern unless other factors also indicate problems, e.g. large
+values for <a href="#reload">reloads</a> .
+<p>
+<table border="1" cols="2" width="50%">
+  <tbody>
+    <tr>
+      <td>Optimum</td>
+      <td>Small but non-zero</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>SHARED_POOL_SIZE</td>
+    </tr>
+  </tbody>
+</table>
+</p>
+<h3><a name="reload"></a>Shared Pool Reloads</h3>
+<pre>100*( valdiff( stats$librarycache, reloads)<br>	  / valdiff( stats$librarycache, pins)<br>    )<br></pre>
+The proportion of attempts to execute code where the code was in memory
+but
+isn't any more. Shared pool reloads occur when Oracle has to implicitly
+reparse SQL or PL/SQL at the point when it attempts to execute it.
+A larger shared pool wil reduce the number of times that code needs to
+be reloaded. Also, ensuring that similar pieces of SQL are written
+identically will increase sharing of code.
+<p>See also <a href="#reloadps">Reloads per Second</a>.
+</p>
+<p>To take advantage of additional memory available for shared SQL
+areas,
+you may also need to increase the number of cursors permitted for a
+session.
+You can do this by increasing the value of the initialization parameter
+OPEN_CURSORS.
+</p>
+<p>
+<table border="1" cols="2" width="50%">
+  <tbody>
+    <tr>
+      <td>Optimum</td>
+      <td>Low</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>SHARED_POOL_SIZE</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>OPEN_CURSORS</td>
+    </tr>
+  </tbody>
+</table>
+</p>
+<h2><a name="reloadps"></a>Reloads per Second</h2>
+<h2>
+<a name="lchits"></a>Library Cache Hits</h2>
+This graph is closely related to <a href="#reload">shared pool reloads</a>
+. Improving these figures is carried out in the same manner
+as discussed in that section. The graph includes two figures
+<h3><a name="lgethits"></a>Library Cache Get Hit Ratio</h3>
+<pre>100*( valdiff( stats$librarycache, gethits)<br>	  / valdiff( stats$librarycache, gets)<br>    )<br></pre>
+The proportion of requests for a lock on an object which were satisfied
+by finding
+that object's handle already in memory.
+<p>
+<table border="1" cols="2" width="50%">
+  <tbody>
+    <tr>
+      <td>Optimum</td>
+      <td>High</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>SHARED_POOL_SIZE</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>OPEN_CURSORS</td>
+    </tr>
+  </tbody>
+</table>
+</p>
+<h3><a name="pinhits"></a>
+Library Cache Pin Hit Ratio</h3>
+<pre>100*( valdiff( stats$librarycache, pinhits)<br>	  / valdiff( stats$librarycache, pins)<br>    )<br></pre>
+The proportion of attempts to pin an object which were satisfied by
+finding
+all the pieces of that object already in memory.
+<p>
+<table border="1" cols="2" width="50%">
+  <tbody>
+    <tr>
+      <td>Optimum</td>
+      <td>High</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>SHARED_POOL_SIZE</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>OPEN_CURSORS</td>
+    </tr>
+  </tbody>
+</table>
+</p>
+<h2><a name="wtpct">Wait Percentages</a></h2>
+<h3>
+<a href="buffnowait"></a>Buffer Nowait Percentage</h3>
+<pre>100*( 1 - ( valdiff( stats$waitstat, wait_count )<br>	      / valdiff( stats$sysstat, 'session logical reads' )<br>          )<br>    )<br></pre>
+The buffer no wait percentage is an indication of the proportion of
+requests
+for a buffer block which immediately succeeded. Buffer waits indicate a
+problem with the size of the buffer cache (though check the <a
+ href="buffer">
+Buffer Cache hit Ratio</a>) or with the database writer(s) becoming
+overloaded.
+<p>
+<table border="1" cols="2" width="50%">
+  <tbody>
+    <tr>
+      <td>Optimum</td>
+      <td>High</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>DBWR_IO_SLAVES</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>DB_WRITER_PROCESSES</td>
+    </tr>
+  </tbody>
+</table>
+</p>
+<h3><a href="redonowait"></a>Redo Nowait Percentage</h3>
+<pre>100*( 1 - ( valdiff( stats$sysstat, 'redo log space requests' )<br>	      / valdiff( stats$sysstat, 'redo entries' )<br>          )<br>    )<br></pre>
+This figure gives an indication of the level of contention
+occuring for the redo buffer, which holds information about changes
+made to the
+database.
+A redo space wait is when there is insufficient space in the redo
+buffer
+for a transaction to write redo information. It is an indication
+that the redo buffer is too small given the rate of transactions
+occurring
+in relation to the rate at which the log writer is writing data to the
+redo logs, or that there are problems with checkpointing or archiving.
+<p>
+<table border="1" cols="2" width="50%">
+  <tbody>
+    <tr>
+      <td>Optimum</td>
+      <td>High</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>LOG_BUFFER</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>LOG_PARALLELISM</td>
+    </tr>
+  </tbody>
+</table>
+</p>
+<h2><a name="nonparsecpu"></a>Non-Parse CPU</h2>
+<pre>100*( 1 - ( valdiff( stats$sysstat, 'parse time cpu' )<br>	      / valdiff( stats$sysstat, 'CPU used by this session' )<br>          )<br>    )<br></pre>
+All of the values in the <a href="parse">Parse</a> graph may be
+insignificant
+if parsing is not using a great deal of CPU time. Essentially,
+minimising the
+parsing as per that section will increase the percentage of CPU time
+available
+for other activities.
+<h2><a name="parse"></a>Parsing</h2>
+The parsing graph has three elements
+<h3><a href="softparse"></a>Soft Parse</h3>
+<pre>100*(1 - ( valdiff( stats$sysstat, 'parse count (hard)' )<br>             / valdiff( stats$sysstat, 'parse count (total)' )<br>          )<br>    )<br></pre>
+This is the proportion of parsing in the database which qualifies as a
+soft
+parse. A hard parse occurs when a SQL statement is executed which is
+unknown
+to the shared pool, requiring memory allocation, semantic checking,
+etc. In
+comparison, a soft parse occurs when the database can match a SQL
+statement to
+one already present in the shared pool, and so is a much lighter
+process.
+<p>Low values indicate either
+that poor use is being made of shared SQL or that SQL is being aged out
+of the
+shared pool before it is re-used. The latter may indicate a problem
+with the
+size of the <a href="shpool">Shared Pool</a>.
+</p>
+<p>
+<table border="1" cols="2" width="50%">
+  <tbody>
+    <tr>
+      <td>Optimum</td>
+      <td>High</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>SESSION_CACHED_CURSORS</td>
+    </tr>
+  </tbody>
+</table>
+</p>
+<h3><a href="extoparse"></a>Execute to Parse</h3>
+<pre>100*( 1 - ( valdiff( stats$sysstat, 'parse count (total)' )<br>	      / valdiff( stats$sysstat, 'execute count' )<br>          )<br>    )<br></pre>
+This is an indication of how many times a piece of SQL is executed
+for each time it is parsed. A repeated execution without reparsing is
+achieved by holding an open cursor on the statement.
+<p>
+<table border="1" cols="2" width="50%">
+  <tbody>
+    <tr>
+      <td>Optimum</td>
+      <td>High</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>OPEN_CURSORS</td>
+    </tr>
+    <tr>
+      <td>init.ora parameter</td>
+      <td>SESSION_CACHED_CURSORS</td>
+    </tr>
+  </tbody>
+</table>
+</p>
+<h3><a href="parselcpu"></a>Parse CPU to Parse Elapsed</h3>
+<pre>100*( valdiff( stats$sysstat, 'parse time cpu' )<br>        / valdiff( stats$sysstat, 'parse time elapsed' )<br>    )<br></pre>
+This figure indicates the amount of CPU time taken by parsing compared
+with the
+actual elapsed time. It is, therefore, an indicator of whether CPU is
+available for parsing.
+<h2><a name="latches"></a>Latches</h2>
+Latches are simple, low-level serialization mechanisms to protect
+shared
+data structures in the SGA. When attempting to get a latch a process
+may
+be willing to wait, hence this graph includes two figures.
+<h3><a name="wtwlatchit"></a>Willing to Wait Latch Gets</h3>
+<pre>100*(1 - ( valdiff( stats$latch, misses )<br>             / valdiff( stats$latch, gets )<br>         )<br>    )<br></pre>
+An attempt by a process to obtain a latch which is willing to wait will
+sleep and retry until it obtains the latch.
+<p>
+<table border="1" cols="2" width="50%">
+  <tbody>
+    <tr>
+      <td>Optimum</td>
+      <td>High</td>
+    </tr>
+  </tbody>
+</table>
+</p>
+<h3><a name="immlatchit"></a>Immediate Latch Gets</h3>
+<pre>100*(1 - ( valdiff( stats$latch, immediate_misses )<br>             / valdiff( stats$latch, immediate_gets )<br>         )<br>    )<br></pre>
+An attempt to obtain a latch which a process is not allowed to wait for
+will timeout.
+<p>
+<table border="1" cols="2" width="50%">
+  <tbody>
+    <tr>
+      <td>Optimum</td>
+      <td>High</td>
+    </tr>
+  </tbody>
+</table>
+</p>
+<h2><a name="rollcont"></a>Rollback Segment Contention</h2>
+<pre>100*( valdiff( stats$rollstat, waits )<br>        / valdiff( stats$rollstat, gets )<br>    )<br></pre>
+This figure is an indication of whether a process had to wait to get
+access
+to a rollback segment. To improve figures, increase the number of
+rollback segments available.
+<p>
+<table border="1" cols="2" width="50%">
+  <tbody>
+    <tr>
+      <td>Optimum</td>
+      <td>Low</td>
+    </tr>
+  </tbody>
+</table>
+</p>
+<h2><a name="transactions">Total Transactions over interval</a></h2>
+<pre>valdiff( stats$sysstat, 'user rollbacks' )<br>+<br>valdiff( stats$sysstat, 'user commits' )<br></pre>
+<h2>
+<a name="sessions">Total Sessions over interval</a></h2>
+<pre>valdiff( stats$sysstat, 'user rollbacks' )<br>+<br>valdiff( stats$sysstat, 'user commits' )<br></pre>
+<h2>
+<a name="tranps">Transactions per Second</a></h2>
+<pre>( valdiff( stats$sysstat, 'user rollbacks' )<br>+<br>valdiff( stats$sysstat, 'user commits' )<br>)<br>/<br>interval seconds<br></pre>
+<h2>
+<a name="avgocurs">Average Open Cursors</a></h2>
+<pre>stats$syssstat 'opened cursors current'<br> / stats$syssstat 'logons current'<br></pre>
+Note that this value is the number for the end snapshot time - not an
+average
+over the interval!
+<h2><a name="randc">Rollbacks and Commits</a></h2>
+This graph separates out the transaction total into its constituent
+parts
+<h3>Rollbacks</h3>
+<pre>valdiff( stats$sysstat, 'user rollbacks' )<br></pre>
+<h3>Commits</h3>
+<pre>valdiff( stats$sysstat, 'user commits' )<br> / trancount<br><br>valdiff( stats$sysstat, 'user commits' )<br> / interval seconds<br></pre>
+<h2>
+<a name="redo">Redo Size</a></h2>
+<pre>valdiff( stats$sysstat, 'redo size' )<br> / trancount<br><br>valdiff( stats$sysstat, 'redo size' )<br> / interval seconds<br></pre>
+<h2>
+<a name="logreads">Logical Reads</a></h2>
+<pre>valdiff( stats$sysstat, 'session logical reads' )<br> / trancount<br><br>valdiff( stats$sysstat, 'session logical reads' )<br> / interval seconds<br></pre>
+<h2>
+<a name="bchng">Block Changes</a></h2>
+<pre>valdiff( stats$sysstat, 'db block changes' )<br> / trancount<br><br>valdiff( stats$sysstat, 'db block changes' )<br> / interval seconds<br></pre>
+<h2>
+<a name="phyreads">Physical Reads</a></h2>
+<pre>valdiff( stats$sysstat, 'physical reads' ) * blocksize / 1024<br> / trancount<br><br>valdiff( stats$sysstat, 'physical reads' ) * blocksize / 1024<br> / interval seconds<br></pre>
+This measures the amount of kilobytes read
+<h2><a name="phywrts">Physical Writes</a></h2>
+<pre>valdiff( stats$sysstat, 'physical writes' ) * blocksize / 1024<br> / trancount<br><br>valdiff( stats$sysstat, 'physical writes' ) * blocksize / 1024<br> / interval seconds<br></pre>
+This measures the amount of kilobytes written
+<h2><a name="ucalls">User Calls</a></h2>
+<pre>valdiff( stats$sysstat, 'user calls' )<br> / trancount<br><br>valdiff( stats$sysstat, 'user calls' )<br> / interval seconds<br></pre>
+<h2>
+<a name="pcount">Parse Count</a></h2>
+<pre>valdiff( stats$sysstat, 'parse count (total)' )<br> / trancount<br><br>valdiff( stats$sysstat, 'parse count (total)' )<br> / interval seconds<br></pre>
+<h2>
+<a name="hpcount">Hard Parse Count</a></h2>
+<pre>valdiff( stats$sysstat, 'parse count (hard)' )<br> / trancount<br><br>valdiff( stats$sysstat, 'parse count (hard)' )<br> / interval seconds<br></pre>
+<h2>
+<a name="scount">Sort Count</a></h2>
+<pre>( <br>valdiff( stats$sysstat, 'sorts (memory)' )<br>  +<br>valdiff( stats$sysstat, 'sorts (disk)' )<br>)<br> / trancount<br><br>( <br>valdiff( stats$sysstat, 'sorts (memory)' )<br>  +<br>valdiff( stats$sysstat, 'sorts (disk)' )<br>)<br> / interval seconds<br></pre>
+<h2>
+<a name="lcount">Logons Count</a></h2>
+<pre>valdiff( stats$sysstat, 'logons cumulative' )<br> / trancount<br><br>valdiff( stats$sysstat, 'logons cumulative' )<br> / interval seconds<br></pre>
+<h2>
+<a name="exes">Executes</a></h2>
+<pre>valdiff( stats$sysstat, 'execute count' )<br> / trancount<br><br>valdiff( stats$sysstat, 'execute count' )<br> / interval seconds<br></pre>
+<h2>
+<a name="reloadps">Reloads per Second</a></h2>
+<pre>valdiff( stats$librarycache, sum(reloads) )<br> / trancount<br><br>valdiff( stats$librarycache, sum(reloads) )<br> / interval seconds<br></pre>
+<h2>
+<a name="dbsize">Database Size</a></h2>
+<h3>Data Size</h3>
+<pre>select sum(bytes) from sys.dba_data_files<br>+<br>select sum(bytes) from sys.dba_temp_files<br>-<br>select sum(bytes) from sys.dba_free_space<br></pre>
+The Data Size is the total amount of space allocated to database
+segments
+including data, indexes, rollback and temporary.
+<h3>Free Space Size</h3>
+<pre>select sum(bytes) from sys.dba_free_space<br></pre>
+This is all the space in the database which has not been allocated to
+objects.
+<p>These add up to the total "external" size of the database i.e. the
+disk space
+allocated to Oracle datafiles and tempfiles.
+</p>
+<h2><a name="tspace">Max &amp; Mean Tablespace Percent Full</a></h2>
+This graph uses the percent full values for each tablespace, so a large
+tablespace and a small one are evaluated equally.
+<h3>Average Percent Full</h3>
+This figure simply divides the sum of percent full by the number of
+tablespaces.
+<h3>Maximum Percent Full</h3>
+This picks out the fullest tablespace - excluding those with TEMP, ROLL
+or RBS
+in their names.
+<h1><a name="further"></a>Further Information</h1>
+There are many sources of further information on all the subjects
+included
+here.
+<h3> Online</h3>
+A valuable source is Oracle's <a href="http://technet.oracle.com">Technology
+Network</a>, particularly the Documentation on Concepts and Tuning.
+<p>Other sources include:
+</p>
+<ul>
+  <li>
+    <a href="http://www.doag.org/mirror/frank/faqmain.htm">The Oracle
+Underground
+FAQ</a></li>
+  <li>
+    <a href="http://www.oraworld.com/">The Database Domain</a></li>
+  <li>
+    <a href="http://www.oracleuser.co.uk/">UK Oracle User Group</a></li>
+  <li>
+    <a href="%20http://www.ixora.com.au/">Ixora</a></li>
+  <li>
+    <a href="http://www.tusc.com/tusc/document.html">TUSC Documentation</a></li>
+</ul>
+Naturally, all these sites also have links.
+<h3> Offline</h3>
+A large number of books have been written on the subject. Two
+publishers worth checking out are <a href="http://oracle.oreilly.com/">O'Reilly</a>
+and <a href="http://www.sideris.com/orpress/">Oracle Press</a>.
+</div>
+</body>
+</html>
